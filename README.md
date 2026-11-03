@@ -1,0 +1,1 @@
+protPheMut2 aims to expand the analysis of protein-protein complexes, thereby enhancing the understanding of the relationship between human missense mutations and conditions such as cancer and neurodevelopmental disorders (NDDs).
