@@ -1,7 +1,9 @@
 import numpy as np
-from numba import njit
+from src.utils.entropy import calculate_site_entropy
+from src.utils.log_likelihood_ratio import calculate_substitution_score
+from src.utils.mutual_information import calculate_cross_chain_mi
 
-class MSAparser:
+class MSAParser:
     """"""
     def __init__(self, path: str) -> None:
         """"""
@@ -13,7 +15,6 @@ class MSAparser:
         def remove_a3m_insertions(sequence: str) -> str:
             """"""
             removed = ""
-
             for ch in sequence:
                 if not (ch.islower() or ch == "."):
                     removed += ch
@@ -57,9 +58,14 @@ class MSAparser:
             start = end
 
 
-class MSAencoder:
+class MSAEncoder:
     """"""
-    def __init__(self, headers: list[str], aligned_sequences: list[str], chain_slices: list[tuple[int, int]]) -> None:
+    def __init__(
+        self, 
+        headers: list[str], 
+        aligned_sequences: list[str], 
+        chain_slices: list[tuple[int, int]]
+    ) -> None:
         """"""
         self.headers = headers
         self.aligned_sequences = aligned_sequences
@@ -67,12 +73,7 @@ class MSAencoder:
 
     def select_chain(self, chain_index: int) -> None:
         start, end = self.chain_slices[chain_index]
-
-        self.aligned_sequences = [
-            sequence[start:end]
-            for sequence in self.aligned_sequences
-        ]
-
+        self.aligned_sequences = [sequence[start:end] for sequence in self.aligned_sequences]
         self.chain_slices = [(0, end - start)]
 
     def deduplicate_msa(self) -> None:
@@ -128,102 +129,23 @@ class MSAencoder:
         self.encoded_msa = np.array(rows, dtype=np.uint8)
 
 
-@njit
-def pair_identity(
-    seq_a: np.ndarray, 
-    seq_b: np.ndarray
-) -> float:
+class EvolEncoder:
     """"""
-    valid_a = seq_a < 20
-    valid_b = seq_b < 20
-
-    compared = valid_a | valid_b
-    matched = valid_a & valid_b & (seq_a == seq_b)
-
-    n_compared = np.count_nonzero(compared)
-    n_matched = np.count_nonzero(matched)
-
-    return n_matched / n_compared
-    
-
-@njit
-def calculate_site_entropy(
-    encoded_msa: np.ndarray,
-    identity_threshold: float = 0.8,
-) -> tuple[np.ndarray, np.ndarray]:
-    """"""
-    #
-    n_sequences = encoded_msa.shape[0]
-    neighbor_counts = np.ones(n_sequences, dtype=np.int64)
-
-    for i in range(n_sequences):
-        for j in range(i + 1, n_sequences):
-            identity= pair_identity(encoded_msa[i], encoded_msa[j])
-            if identity >= identity_threshold:
-                neighbor_counts[i] += 1
-                neighbor_counts[j] += 1
-
-    weights = 1.0 / neighbor_counts
-
-    #
-    n_sequences, n_positions = encoded_msa.shape
-
-    counts = np.zeros((n_positions, 20), dtype=np.float64,)
-    for i in range(n_sequences):
-        for j in range(n_positions):
-            aa = encoded_msa[i, j]
-            if aa < 20:
-                counts[j, aa] += weights[i]
-
-    frequencies = np.full((n_positions, 20), np.nan, dtype=np.float64)
-    for j in range(n_positions):
-        total_weight = counts[j].sum()
-        if total_weight > 0:
-            frequencies[j] = counts[j] / total_weight
-
-    #
-    n_positions = frequencies.shape[0]
-    entropies = np.full(n_positions, np.nan, dtype=np.float64)
-
-    for j in range(n_positions):
-        p = frequencies[j]
-        if np.isnan(p).any():
-            continue
-        p_positive = p[p > 0]
-        entropy = -np.sum(p_positive * np.log(p_positive))
-        entropies[j] = entropy / np.log(20)
-
-    return entropies, counts
-
-def calculate_substitution_score(
-    weighted_counts: np.ndarray,
-    position: int,
-    wt: str,
-    mut: str,
-    alpha: float = 1.0,
-) -> float:
-    """"""
-    site_counts = weighted_counts[position - 1]
-    if site_counts.sum() == 0:
-        return np.nan
-    
-    alphabet = "ACDEFGHIKLMNPQRSTVWY"
-    wt_index = alphabet.index(wt)
-    mut_index = alphabet.index(mut)
-
-    wt_count = site_counts[wt_index]
-    mut_count = site_counts[mut_index]
-    pseudo_per_aa = alpha / 20
-    score = -np.log((mut_count + pseudo_per_aa) / (wt_count + pseudo_per_aa))
-
-    return float(score)
-
-class mutationEncoder:
-    def __init__(self, path, encoded_msa):
+    def __init__(
+        self,
+        path: str,
+        encoded_msa: np.ndarray,
+        chain_slices: list[tuple[int, int]],
+        is_complex: bool
+    ) -> None:
+        """"""
         self.read_mutations(path)
         self.encoded_msa = encoded_msa
+        self.chain_slices = chain_slices
+        self.is_complex = is_complex
 
     def read_mutations(self, path: str) -> None:
+        """"""
         with open(path) as f:
             lines = f.readlines()
 
@@ -241,8 +163,16 @@ class mutationEncoder:
                 "mut": mut 
             })
 
-    def encode_conservation(self) -> None:
+    def encode(self) -> None:
+        """"""
+        a_start, a_end = self.chain_slices[0]
+        length_a = a_end - a_start
+
         site_entropies, counts = calculate_site_entropy(self.encoded_msa)
+        mi_scores = calculate_cross_chain_mi(
+            encoded_msa=self.encoded_msa,
+            chain_length_a=length_a,
+        )
 
         for record in self.mutations:
             record["F01"] = float(
@@ -254,7 +184,9 @@ class mutationEncoder:
                 wt=record["wt"],
                 mut=record["mut"],
             )
-
-
-
+            if self.is_complex:
+                column_index = record["position"] - 1
+                record["F03"] = float(mi_scores.get(column_index, np.nan))
+            else:
+                record["F03"] = float('nan')
 
