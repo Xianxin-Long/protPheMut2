@@ -6,9 +6,7 @@ Mutation positions are one-based, while alignment slices are zero-based.
 """
 
 import dataclasses
-
 import numpy as np
-
 from src.utils import entropy
 from src.utils import log_likelihood_ratio
 from src.utils import mutual_information
@@ -313,8 +311,8 @@ class EvolEncoder:
         )
 
         for record in self.mutations:
-            record["F01"] = float(site_entropies[record["position"] - 1])
-            record["F02"] = log_likelihood_ratio.calculate_substitution_score(
+            record["E01"] = float(site_entropies[record["position"] - 1])
+            record["E02"] = log_likelihood_ratio.calculate_substitution_score(
                 weighted_counts=counts,
                 position=record["position"],
                 wt=record["wt"],
@@ -322,6 +320,6 @@ class EvolEncoder:
             )
             if self.is_complex:
                 column_index = record["position"] - 1
-                record["F03"] = float(mi_scores.get(column_index, np.nan))
+                record["E03"] = float(mi_scores.get(column_index, np.nan))
             else:
-                record["F03"] = float("nan")
+                record["E03"] = float("nan")
