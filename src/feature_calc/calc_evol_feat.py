@@ -298,17 +298,18 @@ class EvolEncoder:
         uniform pseudocount. F03 is the mean of the three highest eligible
         APC-corrected cross-chain MI scores, or NaN when unavailable or when
         is_complex is False. Mutation positions must index the first chain.
+        Cross-chain MI is calculated only for complexes.
         """
-        a_start, a_end = self.msa.chain_slices[0]
-        length_a = a_end - a_start
-
         site_entropies, counts = entropy.calculate_site_entropy(
             self.msa.encoded_msa
         )
-        mi_scores = mutual_information.calculate_cross_chain_mi(
-            encoded_msa=self.msa.encoded_msa,
-            chain_length_a=length_a,
-        )
+        if self.is_complex:
+            a_start, a_end = self.msa.chain_slices[0]
+            length_a = a_end - a_start
+            mi_scores = mutual_information.calculate_cross_chain_mi(
+                encoded_msa=self.msa.encoded_msa,
+                chain_length_a=length_a,
+            )
 
         for record in self.mutations:
             record["E01"] = float(site_entropies[record["position"] - 1])
