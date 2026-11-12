@@ -1,0 +1,7 @@
+# Versions used to validate the ML pipeline (Python 3.12).
+numpy==2.5.4
+pandas==3.1.1
+scikit-learn==1.9.1
+optuna==5.0.0
+xgboost==3.4.1
+pytest==9.2.0
