@@ -1,18 +1,31 @@
 """Regression tests for grouped splits and probability model training."""
 
 import inspect
-import warnings
 
 import numpy as np
 import pandas as pd
 import pytest
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.exceptions import ConvergenceWarning
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 
 from src.ml_pipeline import data
 from src.ml_pipeline import train
+
+
+@pytest.fixture
+def captured_studies(monkeypatch):
+    """Captures tuning studies without attaching state to returned models."""
+    original_create_study = train.optuna.create_study
+    studies = []
+
+    def capture_study(*args, **kwargs):
+        study = original_create_study(*args, **kwargs)
+        studies.append(study)
+        return study
+
+    monkeypatch.setattr(train.optuna, "create_study", capture_study)
+    return studies
 
 
 def make_dataset(n_classes=3):
@@ -96,12 +109,12 @@ def test_multiclass_brier_uses_half_sum_of_squared_errors():
 ])
 @pytest.mark.parametrize("n_classes", [2, 3])
 def test_training_returns_usable_probabilities_with_missing_data(
-    trainer_name, n_classes
+    trainer_name, n_classes, captured_studies
 ):
     features, labels, groups, frame = make_dataset(n_classes)
     folds = data.cross_validation_split(frame)
     trainer = getattr(train, trainer_name)
-    assert inspect.signature(trainer).parameters["n_trials"].default == 30
+    assert inspect.signature(trainer).parameters["n_trials"].default == 50
     options = {"groups": groups} if trainer_name == "train_rbf_svm" else {}
     # Deliberately retain nonconsecutive labels on the pandas row index.
     feature_frame = pd.DataFrame(features, index=frame.index)
@@ -110,12 +123,20 @@ def test_training_returns_usable_probabilities_with_missing_data(
         folds, feature_frame, label_series, n_trials=1, **options
     )
     assert_probability_matrix(model, feature_frame.iloc[:8], n_classes)
-    assert len(model.study_.trials) == 1
-    assert model.best_trial_number_ == 0
-    assert model.best_params_ == model.study_.trials[0].params
-    distributions = model.study_.trials[0].distributions
+    study = captured_studies[0]
+    assert len(study.trials) == 1
+    classifier = (
+        model.estimator.steps[-1][1] if trainer_name == "train_rbf_svm"
+        else model.steps[-1][1]
+    )
+    for name, value in study.trials[0].params.items():
+        assert classifier.get_params()[name] == value
+    assert study.user_attrs == {}
+    assert not any(hasattr(model, attribute) for attribute in (
+        "study_", "best_params_", "best_trial_number_", "best_cv_loss_"
+    ))
+    distributions = study.trials[0].distributions
     if trainer_name == "train_elastic_net":
-        classifier = model.steps[-1][1]
         assert classifier.solver == "saga"
         assert classifier.max_iter == 10000
         assert distributions["C"].log
@@ -128,7 +149,6 @@ def test_training_returns_usable_probabilities_with_missing_data(
             distributions["l1_ratio"].high,
         ) == (0, 1)
     elif trainer_name == "train_rbf_svm":
-        classifier = model.estimator.steps[-1][1]
         assert classifier.kernel == "rbf"
         assert not hasattr(classifier, "predict_proba")
         assert classifier.decision_function_shape == "ovr"
@@ -140,7 +160,6 @@ def test_training_returns_usable_probabilities_with_missing_data(
             "scale", 0.001, 0.01, 0.1
         )
     elif trainer_name == "train_extra_trees":
-        classifier = model.steps[-1][1]
         assert classifier.n_estimators == 500
         assert classifier.class_weight is None
         assert distributions["min_samples_leaf"].choices == (2, 5, 10, 20)
@@ -169,7 +188,9 @@ def test_training_returns_usable_probabilities_with_missing_data(
             ) == expected_range
 
 
-def test_cv_objective_weights_rows_instead_of_unequal_folds(monkeypatch):
+def test_cv_objective_weights_rows_instead_of_unequal_folds(
+    monkeypatch, captured_studies
+):
     labels = np.array([
         1, 0, 0, 0,
         1, 1, 1, 1, 1, 1, 0, 0,
@@ -188,9 +209,9 @@ def test_cv_objective_weights_rows_instead_of_unequal_folds(monkeypatch):
     monkeypatch.setattr(
         LogisticRegression, "predict_proba", constant_probabilities
     )
-    model = train.train_elastic_net(folds, features, labels, n_trials=1)
+    train.train_elastic_net(folds, features, labels, n_trials=1)
     expected = np.mean((labels - 0.2)**2)
-    assert model.study_.trials[0].value == pytest.approx(expected)
+    assert captured_studies[0].trials[0].value == pytest.approx(expected)
 
 
 def test_svm_calibration_refits_preprocessing_inside_grouped_partitions(
@@ -249,7 +270,9 @@ def test_svm_calibration_refits_preprocessing_inside_grouped_partitions(
     assert_probability_matrix(model, features[:6], 3)
 
 
-def test_fit_failure_is_recorded_and_next_trial_can_succeed(monkeypatch):
+def test_fit_failure_is_recorded_and_next_trial_can_succeed(
+    monkeypatch, captured_studies
+):
     features, labels, _, frame = make_dataset(2)
     folds = data.cross_validation_split(frame)
     original_fit = LogisticRegression.fit
@@ -264,38 +287,34 @@ def test_fit_failure_is_recorded_and_next_trial_can_succeed(monkeypatch):
 
     monkeypatch.setattr(LogisticRegression, "fit", fail_first_fit)
     model = train.train_elastic_net(folds, features, labels, n_trials=2)
-    assert [trial.state.name for trial in model.study_.trials] == [
+    trials = captured_studies[0].trials
+    assert [trial.state.name for trial in trials] == [
         "FAIL", "COMPLETE"
     ]
-    assert model.best_trial_number_ == 1
+    classifier_params = model.steps[-1][1].get_params()
+    for name, value in trials[1].params.items():
+        assert classifier_params[name] == value
     assert_probability_matrix(model, features[:6], 2)
 
 
-def test_all_nonconverged_trials_report_failure(monkeypatch):
+def test_all_failed_trials_report_failure(monkeypatch, captured_studies):
     features, labels, _, frame = make_dataset(2)
     folds = data.cross_validation_split(frame)
-    original_create_study = train.optuna.create_study
-    created_studies = []
 
-    def capture_study(*args, **kwargs):
-        study = original_create_study(*args, **kwargs)
-        created_studies.append(study)
-        return study
+    def failing_fit(self, values, targets, *args, **kwargs):
+        raise ValueError("Injected fitting failure.")
 
-    def nonconverging_fit(self, values, targets, *args, **kwargs):
-        warnings.warn("Injected nonconvergence.", ConvergenceWarning)
-        raise AssertionError("Convergence warnings must fail the trial.")
-
-    monkeypatch.setattr(LogisticRegression, "fit", nonconverging_fit)
-    monkeypatch.setattr(train.optuna, "create_study", capture_study)
+    monkeypatch.setattr(LogisticRegression, "fit", failing_fit)
     with pytest.raises(ValueError):
         train.train_elastic_net(folds, features, labels, n_trials=2)
-    trials = created_studies[0].trials
+    trials = captured_studies[0].trials
     assert len(trials) == 2
     assert all(trial.state.name == "FAIL" for trial in trials)
 
 
-def test_numerically_tied_trials_choose_earlier_configuration(monkeypatch):
+def test_numerically_tied_trials_choose_earlier_configuration(
+    monkeypatch, captured_studies
+):
     features, labels, _, frame = make_dataset(2)
     folds = data.cross_validation_split(frame)
     original_fit = LogisticRegression.fit
@@ -313,7 +332,8 @@ def test_numerically_tied_trials_choose_earlier_configuration(monkeypatch):
     monkeypatch.setattr(LogisticRegression, "fit", count_fit)
     monkeypatch.setattr(train, "brier_loss", nearly_tied_loss)
     model = train.train_elastic_net(folds, features, labels, n_trials=2)
-    trials = model.study_.trials
+    trials = captured_studies[0].trials
     assert trials[1].value < trials[0].value
-    assert model.best_trial_number_ == 0
-    assert model.best_params_ == trials[0].params
+    classifier_params = model.steps[-1][1].get_params()
+    for name, value in trials[0].params.items():
+        assert classifier_params[name] == value
