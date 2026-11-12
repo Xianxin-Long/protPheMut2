@@ -10,6 +10,7 @@ from sklearn import calibration
 from sklearn import ensemble
 from sklearn import impute
 from sklearn import linear_model
+from sklearn import metrics
 from sklearn import model_selection
 from sklearn import pipeline
 from sklearn import preprocessing
@@ -33,11 +34,13 @@ def brier_loss(y_true: ArrayLike, proba: ArrayLike) -> float:
     Returns:
         Brier loss, equal to positive-class MSE for binary classification.
     """
-    labels = np.asarray(y_true)
     probabilities = np.asarray(proba, dtype=float)
-    one_hot = np.eye(probabilities.shape[1])[labels]
-    sample_loss = 0.5 * np.sum((probabilities - one_hot) ** 2, axis=1)
-    return float(sample_loss.mean())
+    return metrics.brier_score_loss(
+        y_true,
+        probabilities,
+        labels=np.arange(probabilities.shape[1]),
+        scale_by_half=True,
+    )
 
 
 def _make_pipeline(estimator, *, standardize: bool = False):
